@@ -295,9 +295,20 @@ impl UDateFormat {
                 &mut status,
             )
         } as usize;
-        common::Error::ok_or_warning(status)?;
-        result.resize(total_size as usize);
-        if total_size > CAP {
+
+        // ICU is inconsistent about an output that does not fit: some paths raise
+        // U_BUFFER_OVERFLOW_ERROR, others truncate silently and return the length
+        // they wanted. Check both, as rust_icu_umsg and
+        // common::buffered_string_method_with_retry do.
+        if status == sys::UErrorCode::U_BUFFER_OVERFLOW_ERROR
+            || (common::Error::is_ok(status) && total_size > CAP)
+        {
+            // The first call only measured the output. Clear the status before
+            // calling again: an ICU entry point does no work when the status it
+            // receives already holds an error, so a retry that reuses a failed
+            // status is a silent no-op.
+            status = common::Error::OK_CODE;
+            result.resize(total_size);
             // Requires that result is a buffer that has length and capacity of
             // exactly total_size, and that self.rep is a valid pointer to
             // a `UDateFormat`.
@@ -313,6 +324,9 @@ impl UDateFormat {
                 );
             };
             common::Error::ok_or_warning(status)?;
+        } else {
+            common::Error::ok_or_warning(status)?;
+            result.resize(total_size);
         }
         String::try_from(&result)
     }
@@ -532,6 +546,23 @@ mod tests {
                 t.expected, actual
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn format_longer_than_initial_buffer() -> Result<(), common::Error> {
+        // A pattern whose output is larger than the initial 1024-unit buffer.
+        // Before the fix, `format` returned Sys(U_BUFFER_OVERFLOW_ERROR)
+        // instead of growing the buffer and retrying.
+        let literal = "x".repeat(2000);
+        let pattern = format!("yyyy '{}'", literal);
+        let loc = uloc::ULoc::try_from("en-US")?;
+        let tz_id = ustring::UChar::try_from("UTC")?;
+        let pattern = ustring::UChar::try_from(pattern.as_str())?;
+        let fmt = super::UDateFormat::new_with_pattern(&loc, &tz_id, &pattern)?;
+        let actual = fmt.format(0.0)?;
+        assert!(actual.len() > 1024);
+        assert!(actual.ends_with(&literal));
         Ok(())
     }
 
